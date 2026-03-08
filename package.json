@@ -1,0 +1,25 @@
+{
+  "name": "root-daemon",
+  "version": "0.1.0",
+  "description": "Root Daemon - Privileged Task Executor",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.6.0",
+    "pino": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^1.6.1",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
