@@ -6,8 +6,9 @@
  *   - Capture stdout/stderr via PassThrough → gzip → log file
  *   - Enforce timeout watchdog (SIGTERM → 5s → SIGKILL)
  *   - Collect first 4KB snippets of stdout/stderr
+ *   - Collect last 512 chars tail of stdout/stderr (for EXECUTION_RESULT)
  *   - Call TaskManager.complete() when done
- *   - TODO (C6): trigger Notifier.notify()
+ *   - Return ExecutionOutcome with exitCode, signal, snippets
  */
 
 import { spawn } from 'node:child_process';
@@ -28,12 +29,39 @@ const SHELL_META_RE = /[|&;<>$`(){}*?[\]~\n]/;
 // Snippet cap: first 4KB of each stream
 const SNIPPET_LIMIT = 4 * 1024;
 
+// Tail snippet cap: last 512 chars for EXECUTION_RESULT
+const TAIL_LIMIT = 512;
+
 // Gzip flush triggers
 const FLUSH_BYTES = 1 * 1024 * 1024; // 1 MB
 const FLUSH_INTERVAL_MS = 1_000;      // 1 s
 
 // Default log base (can be overridden via ROOT_DAEMON_LOG env or constructor)
 const DEFAULT_LOG_BASE = process.env['ROOT_DAEMON_LOG'] ?? '/var/log/root-daemon';
+
+// ── Execution Outcome ─────────────────────────────────────────────────────────
+
+/**
+ * Returned by Executor.run() after task execution completes.
+ * Used by AgentClient to build EXECUTION_RESULT WS message.
+ */
+export interface ExecutionOutcome {
+  exitCode: number | null;
+  signal: string | null;
+  /** First 4KB of stdout (for existing complete/notify usage) */
+  stdoutSnippet: string;
+  /** First 4KB of stderr */
+  stderrSnippet: string;
+  /** Last 512 chars of stdout (for EXECUTION_RESULT) */
+  stdoutTail: string;
+  /** Last 512 chars of stderr (for EXECUTION_RESULT) */
+  stderrTail: string;
+  startedAt: number;   // Unix ms
+  endedAt: number;     // Unix ms
+  executedOk: boolean;  // true if spawn succeeded and process ran; false if spawn/error
+  logFile: string | null;
+  timedOut: boolean;
+}
 
 export interface ExecutorOptions {
   /** Override log directory root (useful for tests). Default: process.env.ROOT_DAEMON_LOG ?? /var/log/root-daemon */
@@ -67,10 +95,12 @@ export class Executor {
    * - Otherwise → sh -c <command>
    * - stdout + stderr merged into gzip-compressed log file
    * - Timeout watchdog: SIGTERM, then SIGKILL after 5 s
-   * - Calls TaskManager.complete() with final status + snippets
+   * - Calls TaskManager.complete() when done
+   * - Returns ExecutionOutcome with exit code, signal, and snippets
    */
-  async run(task: Task): Promise<void> {
+  async run(task: Task): Promise<ExecutionOutcome> {
     const logFile = this._logPath(task.taskId);
+    const startedAt = Date.now();
 
     // Ensure log directory exists
     await fs.promises.mkdir(path.dirname(logFile), { recursive: true });
@@ -84,11 +114,39 @@ export class Executor {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    // ── Snippet accumulators ────────────────────────────────────────────────
+    // ── Snippet accumulators (first 4KB) ────────────────────────────────────
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
+
+    // ── Tail accumulators (last 512 chars) ──────────────────────────────────
+    // Rolling buffer: keep full chunks until we exceed limit, then drop old ones.
+    const stdoutTailChunks: Buffer[] = [];
+    const stderrTailChunks: Buffer[] = [];
+    let stdoutTailBytes = 0;
+    let stderrTailBytes = 0;
+
+    /** Append to rolling tail buffer, evicting old data when over limit */
+    const appendTail = (tailChunks: Buffer[], tailBytes: { value: number }, chunk: Buffer): void => {
+      tailChunks.push(chunk);
+      tailBytes.value += chunk.length;
+      // Drop chunks from the front until we're under 2x limit (to avoid O(n) on every chunk)
+      while (tailBytes.value > TAIL_LIMIT * 2 && tailChunks.length > 1) {
+        const dropped = tailChunks.shift()!;
+        tailBytes.value -= dropped.length;
+      }
+    };
+
+    /** Flatten tail buffer to string, keeping only the last TAIL_LIMIT chars */
+    const flattenTail = (tailChunks: Buffer[], tailBytes: number): string => {
+      if (tailBytes <= TAIL_LIMIT) {
+        return Buffer.concat(tailChunks).toString('utf8');
+      }
+      const combined = Buffer.concat(tailChunks);
+      const str = combined.toString('utf8');
+      return str.slice(-TAIL_LIMIT);
+    };
 
     // ── PassThrough → Gzip → file ───────────────────────────────────────────
     const pass = new PassThrough();
@@ -112,7 +170,7 @@ export class Executor {
         bytesSinceFlush = 0;
       }
 
-      // Capture snippet
+      // Capture first-4KB snippet
       if (stream === 'stdout' && stdoutBytes < SNIPPET_LIMIT) {
         const remaining = SNIPPET_LIMIT - stdoutBytes;
         const slice = chunk.subarray(0, remaining);
@@ -123,6 +181,13 @@ export class Executor {
         const slice = chunk.subarray(0, remaining);
         stderrChunks.push(slice);
         stderrBytes += slice.length;
+      }
+
+      // Capture rolling tail (last 512 chars)
+      if (stream === 'stdout') {
+        appendTail(stdoutTailChunks, { value: stdoutTailBytes }, chunk);
+      } else if (stream === 'stderr') {
+        appendTail(stderrTailChunks, { value: stderrTailBytes }, chunk);
       }
     };
 
@@ -148,16 +213,19 @@ export class Executor {
     }, timeoutMs);
 
     // ── Await process close ─────────────────────────────────────────────────
-    await new Promise<void>((resolve, reject) => {
+    return new Promise<ExecutionOutcome>((resolve, reject) => {
       child.on('error', (err) => {
         clearTimeout(killTimer);
         clearTimeout(sigkillTimer ?? undefined);
         clearInterval(flushTimer);
         pass.end();
+
+        // Reject so the caller knows the process couldn't even start
         reject(err);
       });
 
-      child.on('close', (code) => {
+      child.on('close', (code, closeSignal) => {
+        const endedAt = Date.now();
         clearTimeout(killTimer);
         if (sigkillTimer !== null) clearTimeout(sigkillTimer);
         clearInterval(flushTimer);
@@ -167,21 +235,42 @@ export class Executor {
 
         const stdoutSnippet = Buffer.concat(stdoutChunks).toString('utf8');
         const stderrSnippet = Buffer.concat(stderrChunks).toString('utf8');
+        const stdoutTail = flattenTail(stdoutTailChunks, stdoutTailBytes);
+        const stderrTail = flattenTail(stderrTailChunks, stderrTailBytes);
+
+        // If process was timed out, closeSignal is what the watchdog sent (SIGTERM/SIGKILL)
+        const processCode = code !== undefined ? code : null;
+        const processSignal = closeSignal ?? (timedOut ? (sigkillTimer !== null ? 'SIGKILL' : 'SIGTERM') : null);
 
         const status: 'DONE' | 'FAILED' | 'TIMEOUT' = timedOut
           ? 'TIMEOUT'
-          : code === 0
+          : processCode === 0
             ? 'DONE'
             : 'FAILED';
 
-        log.info({ taskId: task.taskId, status, exitCode: code }, 'Child process closed');
+        log.info({ taskId: task.taskId, status, exitCode: processCode, signal: processSignal }, 'Child process closed');
+
+        // Build outcome to return
+        const outcome: ExecutionOutcome = {
+          exitCode: processCode,
+          signal: processSignal as string | null,
+          stdoutSnippet,
+          stderrSnippet,
+          stdoutTail,
+          stderrTail,
+          startedAt,
+          endedAt,
+          executedOk: true,
+          logFile,
+          timedOut,
+        };
 
         fileStream.once('finish', () => {
           if (!this.skipTaskComplete) {
             try {
               this.taskManager.complete(task.taskId, {
                 status,
-                exitCode: code,
+                exitCode: processCode,
                 stdoutSnippet,
                 stderrSnippet,
                 logFile,
@@ -197,7 +286,7 @@ export class Executor {
             const result = {
               taskId: task.taskId,
               status,
-              exitCode: code ?? null,
+              exitCode: processCode ?? null,
               stdoutSnippet,
               stderrSnippet,
               logFile,
@@ -208,7 +297,7 @@ export class Executor {
             });
           }
 
-          resolve();
+          resolve(outcome);
         });
 
         fileStream.once('error', (err) => {
@@ -217,7 +306,7 @@ export class Executor {
             try {
               this.taskManager.complete(task.taskId, {
                 status,
-                exitCode: code,
+                exitCode: processCode,
                 stdoutSnippet,
                 stderrSnippet,
                 logFile: null,
@@ -232,7 +321,7 @@ export class Executor {
             const result = {
               taskId: task.taskId,
               status,
-              exitCode: code ?? null,
+              exitCode: processCode ?? null,
               stdoutSnippet,
               stderrSnippet,
               logFile: null,
@@ -243,7 +332,7 @@ export class Executor {
             });
           }
 
-          resolve(); // Resolve anyway; log write failure is non-fatal for task lifecycle
+          resolve(outcome); // Resolve anyway; log write failure is non-fatal for task lifecycle
         });
       });
     });

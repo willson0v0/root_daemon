@@ -5,12 +5,15 @@
  * Connects to wss://approval.willson0v0.com/ws/agent, handles
  * task submission, approval results, and reconnection with
  * exponential backoff.
+ *
+ * CCB-20260501-001: Added EXECUTION_RESULT message for execution result
+ * back-propagation to approval-web.
  */
 
 import { randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
 import { createLogger } from '../logger/index.js';
-import type { Executor } from '../executor/index.js';
+import type { Executor, ExecutionOutcome } from '../executor/index.js';
 import type { Task } from '../types/index.js';
 
 const log = createLogger('agent-client');
@@ -45,12 +48,12 @@ interface ConnectedMessage {
 interface TaskAckMessage {
   type: 'TASK_ACK';
   requestId: string;
-  taskId: number;
+  taskId: string;
 }
 
 interface ApprovalResultMessage {
   type: 'APPROVAL_RESULT';
-  taskId: number;
+  taskId: string;
   action: 'approve' | 'reject';
   timestamp: number;
   /** For passive (N1) tasks: command and description come in the message body itself */
@@ -72,7 +75,21 @@ interface ErrorMessage {
 // SYNC_PENDING from server: re-push approved tasks for machine
 interface SyncPendingResultMessage {
   type: 'SYNC_PENDING_RESULT';
-  tasks: Array<{ taskId: number; action: 'approve' | 'reject' }>;
+  tasks: Array<{ taskId: string; action: 'approve' | 'reject' }>;
+}
+
+// ── CCB-20260501-001: EXECUTION_RESULT message ──
+interface ExecutionResultMessage {
+  type: 'EXECUTION_RESULT';
+  taskId: string;
+  exitCode: number | null;
+  signal: string | null;
+  stdoutSnippet: string;    // last 512 chars (tail)
+  stderrSnippet: string;    // last 512 chars (tail)
+  executionTimeMs: number;
+  startedAt: number;         // Unix ms
+  endedAt: number;           // Unix ms
+  [key: string]: unknown;    // allow assignment to Record<string, unknown>
 }
 
 type IncomingMessage =
@@ -95,7 +112,7 @@ export interface AgentTaskPayload {
 interface PendingTask {
   requestId: string;
   task: AgentTaskPayload;
-  resolve: (taskId: number) => void;
+  resolve: (taskId: string) => void;
   reject: (err: Error) => void;
 }
 
@@ -127,17 +144,22 @@ export class AgentClient {
   private pendingTasks: Map<string, PendingTask> = new Map();
 
   /**
-   * taskIdToPayload: taskId (number) → AgentTaskPayload
+   * taskIdToPayload: taskId (string) → AgentTaskPayload
    * Built when TASK_ACK is received, used to construct synthetic Task for execution.
    */
-  private taskIdToPayload: Map<number, AgentTaskPayload> = new Map();
+  private taskIdToPayload: Map<string, AgentTaskPayload> = new Map();
 
   /**
    * executedTaskIds: Set of taskIds already started execution.
    * Guards against duplicate APPROVAL_RESULT on reconnect.
-   * Note: P2 server sends taskId as string in SYNC_PENDING; we Number()-convert on intake.
    */
-  private executedTaskIds: Set<number> = new Set();
+  private executedTaskIds: Set<string> = new Set();
+
+  /**
+   * CCB-20260501-001: pending execution results not yet delivered to approval-web.
+   * Keyed by taskId (string). Flushed on reconnect.
+   */
+  private pendingResults: Map<string, ExecutionResultMessage> = new Map();
 
   constructor(config: ApprovalWebConfig, executor: Executor) {
     this.config = config;
@@ -154,7 +176,7 @@ export class AgentClient {
    * - If connected: send SUBMIT_TASK, await TASK_ACK, resolve with taskId.
    * - If disconnected: queue until reconnect, then auto-send.
    */
-  submitTask(task: AgentTaskPayload): Promise<number> {
+  submitTask(task: AgentTaskPayload): Promise<string> {
     return new Promise((resolve, reject) => {
       const requestId = randomUUID();
       const pending: PendingTask = { requestId, task, resolve, reject };
@@ -269,6 +291,17 @@ export class AgentClient {
       this._sendSubmitTask(requestId, pending.task);
     }
 
+    // CCB-20260501-001: re-send any pending execution results that couldn't be delivered
+    if (this.pendingResults.size > 0) {
+      log.info({ count: this.pendingResults.size }, 'Flushing pending execution results after reconnect');
+      for (const [, result] of this.pendingResults) {
+        this._send(result);
+        log.debug({ taskId: result.taskId }, 'Re-sent pending EXECUTION_RESULT');
+      }
+      // Keep in pendingResults until we have an ACK mechanism; server side
+      // idempotency (WHERE status='APPROVED') handles duplicate sends.
+    }
+
     // Request server to push any approved-but-unexecuted results
     this._send({
       type: 'SYNC_PENDING',
@@ -294,8 +327,7 @@ export class AgentClient {
   }
 
   private async _onApprovalResult(msg: ApprovalResultMessage): Promise<void> {
-    // Normalize taskId to number (server may send string in some paths)
-    const taskId = Number(msg.taskId);
+    const taskId = msg.taskId;
 
     // Idempotency check: don't execute twice
     if (this.executedTaskIds.has(taskId)) {
@@ -313,17 +345,13 @@ export class AgentClient {
 
       let payload = this.taskIdToPayload.get(taskId);
 
-      // Fallback: passive (N1) task — command/description come in APPROVAL_RESULT body
       if (!payload && msg.command) {
-        log.info({ taskId, command: msg.command }, 'Fallback: building payload from APPROVAL_RESULT body');
-        payload = {
-          command: msg.command,
-          description: msg.description ?? '',
-        };
+        // N1 passive task: payload comes from APPROVAL_RESULT body (designed behavior)
+        payload = { command: msg.command, description: msg.description ?? '', requestedBy: 'nova' };
       }
 
       if (!payload) {
-        log.error({ taskId }, 'No task payload found for taskId, cannot execute');
+        log.error({ taskId }, 'BUG_ON: No payload in taskIdToPayload and no command in APPROVAL_RESULT — internal inconsistency');
         return;
       }
 
@@ -349,16 +377,55 @@ export class AgentClient {
         createdAt: Date.now(),
       };
 
+      let startedAt: number = Date.now();
+      let outcome: ExecutionOutcome | null = null;
+
       try {
-        await this.executor.run(task);
-        log.info({ taskId }, 'Task execution complete');
+        startedAt = Date.now();
+        outcome = await this.executor.run(task);
+        log.info({ taskId, exitCode: outcome.exitCode, executionTimeMs: outcome.endedAt - outcome.startedAt }, 'Task execution complete');
       } catch (err) {
-        log.error({ taskId, err }, 'Task execution failed');
+        startedAt = Date.now();
+        log.error({ taskId, err }, 'Task execution threw exception (spawn failed)');
       }
+
+      // CCB-20260501-001: Build and send EXECUTION_RESULT
+      const endedAt = Date.now();
+
+      const executionResult: ExecutionResultMessage = {
+        type: 'EXECUTION_RESULT',
+        taskId,
+        exitCode: outcome ? outcome.exitCode : -1,
+        signal: outcome ? (outcome.signal as string | null) : null,
+        stdoutSnippet: outcome ? this._truncateTail(outcome.stdoutTail, 512) : '',
+        stderrSnippet: outcome ? this._truncateTail(outcome.stderrTail, 512) : '',
+        executionTimeMs: endedAt - startedAt,
+        startedAt: outcome ? outcome.startedAt : startedAt,
+        endedAt: outcome ? outcome.endedAt : endedAt,
+      };
+
+      this._sendExecutionResult(taskId, executionResult);
     } else {
       // reject
       log.info({ taskId }, 'Task rejected, no execution');
       this._send({ type: 'RESULT_ACK', taskId });
+    }
+  }
+
+  /**
+   * CCB-20260501-001: Send execution result to approval-web.
+   * If WS is closed, store in pendingResults for later retry.
+   */
+  private _sendExecutionResult(taskId: string, msg: ExecutionResultMessage): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this._send(msg);
+      log.info({ taskId, exitCode: msg.exitCode, executionTimeMs: msg.executionTimeMs }, 'EXECUTION_RESULT sent');
+      // Remove from pending if previously stored
+      this.pendingResults.delete(taskId);
+    } else {
+      // WS is disconnected — store for retry on reconnect
+      this.pendingResults.set(taskId, msg);
+      log.info({ taskId }, 'WS not open, EXECUTION_RESULT buffered for retry');
     }
   }
 
@@ -391,5 +458,14 @@ export class AgentClient {
         metadata: task.metadata ?? {},
       },
     });
+  }
+
+  /**
+   * CCB-20260501-001: Truncate text to the last maxLen characters.
+   * Used for stdout/stderr snippets in EXECUTION_RESULT.
+   */
+  private _truncateTail(text: string, maxLen: number): string {
+    if (text.length <= maxLen) return text;
+    return text.slice(text.length - maxLen);
   }
 }
