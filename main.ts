@@ -16,16 +16,39 @@ async function main() {
 
   // Load config
   const config = load();
+  const isWsMode = !!(config.approvalWeb?.url);
 
-  // Init DB
-  const dbPath = process.env['ROOT_DAEMON_DB'] ?? '/var/lib/root-daemon/root-daemon.db';
+  // Init DB (use in-memory for WS mode; no need for persistence on VPS)
+  const dbPath = isWsMode ? ':memory:' : (process.env['ROOT_DAEMON_DB'] ?? '/var/lib/root-daemon/root-daemon.db');
   const db = initDb(dbPath);
 
   // Core services
   const tokenService = new TokenService(config.hmacKey, db);
   const taskManager = new TaskManager(db, tokenService);
 
-  // IPC server
+  if (isWsMode) {
+    // WS mode: connect to remote approval-web (no IPC, no callback server)
+    log.info({ url: config.approvalWeb!.url, machineLabel: config.approvalWeb!.machineLabel }, 'Starting in WS mode');
+    const executor = new Executor(taskManager);
+    const agentClient = new AgentClient(config.approvalWeb!, executor);
+    agentClient.connect();
+
+    // Graceful shutdown
+    const shutdown = async (signal: string) => {
+      log.info({ signal }, 'Shutting down');
+      agentClient.destroy();
+      db.close();
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    process.on('SIGINT', () => void shutdown('SIGINT'));
+
+    log.info('root-daemon ready');
+    return;
+  }
+
+  // ── IPC mode (original behavior) ──────────────────────────────────────────
   const socketPath = process.env['ROOT_DAEMON_SOCK'] ?? '/var/run/root-daemon.sock';
   const ipcServer = new IpcServer({ socketPath });
   await ipcServer.listen();
@@ -39,22 +62,14 @@ async function main() {
 
   // Internal callback server (C6)
   const callbackServer = new InternalCallbackServer(taskManager, executor, config);
+  await callbackServer.start();
 
-  if (config.approvalWeb) {
-    // WS mode: connect to remote approval-web
-    log.info({ url: config.approvalWeb.url, machineLabel: config.approvalWeb.machineLabel }, 'Starting in WS mode');
-    const agentClient = new AgentClient(config.approvalWeb, executor);
-    agentClient.connect();
-  } else {
-    // IPC mode (original behavior)
-    await callbackServer.start();
-
-    // Handle IPC messages from agent
-    ipcServer.on('message', async (message: unknown) => {
-      const msg = message as { $schema?: string; type?: string; payload?: Record<string, unknown> };
-      const payload = msg.payload ?? {};
-      const sessionId = (payload['agentSessionId'] as string) ?? 'unknown';
-      log.info({ sessionId, type: msg.type }, 'IPC message received');
+  // Handle IPC messages from agent
+  ipcServer.on('message', async (message: unknown) => {
+    const msg = message as { $schema?: string; type?: string; payload?: Record<string, unknown> };
+    const payload = msg.payload ?? {};
+    const sessionId = (payload['agentSessionId'] as string) ?? 'unknown';
+    log.info({ sessionId, type: msg.type }, 'IPC message received');
 
       if (msg.type === 'SUBMIT_TASK') {
         const command = payload['command'] as string | undefined;
@@ -85,7 +100,6 @@ async function main() {
         });
       }
     });
-  }
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
