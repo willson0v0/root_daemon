@@ -195,7 +195,15 @@ export class AgentClient {
             this.executedTaskIds.add(taskId);
             // ACK first: "client has started execution"
             this._send({ type: 'RESULT_ACK', taskId });
-            const payload = this.taskIdToPayload.get(taskId);
+            let payload = this.taskIdToPayload.get(taskId);
+            // Fallback: passive (N1) task — command/description come in APPROVAL_RESULT body
+            if (!payload && msg.command) {
+                log.info({ taskId, command: msg.command }, 'Fallback: building payload from APPROVAL_RESULT body');
+                payload = {
+                    command: msg.command,
+                    description: msg.description ?? '',
+                };
+            }
             if (!payload) {
                 log.error({ taskId }, 'No task payload found for taskId, cannot execute');
                 return;
