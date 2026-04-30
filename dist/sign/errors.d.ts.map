@@ -1,1 +1,0 @@
-{"version":3,"file":"errors.d.ts","sourceRoot":"","sources":["../../src/sign/errors.ts"],"names":[],"mappings":"AAAA;;GAEG;AAEH,qBAAa,iBAAkB,SAAQ,KAAK;gBAC9B,OAAO,SAAsB;CAI1C;AAED,qBAAa,iBAAkB,SAAQ,KAAK;gBAC9B,OAAO,SAA+B;CAInD;AAED,qBAAa,yBAA0B,SAAQ,KAAK;gBACtC,OAAO,SAA6D;CAIjF"}
