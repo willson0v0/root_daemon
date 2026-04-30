@@ -64,10 +64,16 @@ export interface DaemonConfig {
     feishu: {
         appId: string;
         appSecret: string;
+        /** Boss's open_id for fallback Feishu notification (C6) */
+        bossChatId?: string;
+        /** Set to false to disable Feishu notifications (default: true) */
+        enabled?: boolean;
     };
     nova: {
         webhookUrl: string;
         sessionKey: string;
+        /** Webhook request timeout in ms (default: 3000) */
+        timeoutMs?: number;
     };
     db?: {
         path?: string;
@@ -85,10 +91,13 @@ export interface RawConfig {
     feishu: {
         appId: string;
         appSecret: string;
+        bossChatId?: string;
+        enabled?: boolean;
     };
     nova: {
         webhookUrl: string;
         sessionKey: string;
+        timeoutMs?: number;
     };
     db?: {
         path?: string;

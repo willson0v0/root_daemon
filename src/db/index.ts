@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import * as fs from 'fs';
 import { createLogger } from '../logger/index.js';
 
 const log = createLogger('db');
@@ -55,6 +56,16 @@ export function init(dbPath?: string): Database.Database {
   log.info({ dbPath: resolvedPath }, 'Initializing SQLite database');
 
   const db = new Database(resolvedPath);
+
+  // Allow group members (e.g. approval-web running as willson0v0) to read/write DB files
+  // WAL mode requires both -wal and -shm to be group-writable
+  try {
+    const gid = parseInt(process.env['ROOT_DAEMON_DB_GID'] ?? '1001', 10); // willson0v0
+    for (const suffix of ['', '-wal', '-shm']) {
+      const p = resolvedPath + suffix;
+      try { fs.chownSync(p, 0, gid); fs.chmodSync(p, 0o664); } catch { /* file may not exist yet */ }
+    }
+  } catch { /* non-fatal */ }
 
   // Enable WAL mode and set synchronous=NORMAL
   db.pragma('journal_mode = WAL');

@@ -56,8 +56,8 @@ export class TaskManager {
   submit(payload: SubmitPayload): { taskId: string; approvalLink: string; expiresAt: number } {
     const taskId = randomUUID();
     const now = Date.now();
-    const expiresInSec = payload.expiresInSec ?? 300;
-    const timeoutSec = payload.timeoutSec ?? 300;
+    const expiresInSec = payload.expiresInSec ?? 86400; // default 24h — Boss may be asleep
+    const timeoutSec = payload.timeoutSec ?? 86400;
     const expiresAt = now + expiresInSec * 1000;
 
     // Generate approval token and link

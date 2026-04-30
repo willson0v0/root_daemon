@@ -91,10 +91,13 @@ export function load() {
         feishu: {
             appId: raw.feishu.appId,
             appSecret: raw.feishu.appSecret,
+            bossChatId: raw.feishu.bossChatId,
+            enabled: raw.feishu.enabled,
         },
         nova: {
             webhookUrl: raw.nova.webhookUrl,
             sessionKey: raw.nova.sessionKey,
+            timeoutMs: raw.nova.timeoutMs,
         },
         db: raw.db,
         web: raw.web,

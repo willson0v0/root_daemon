@@ -97,15 +97,21 @@ export function load(): DaemonConfig {
     feishu: {
       appId: raw.feishu.appId,
       appSecret: raw.feishu.appSecret,
+      bossChatId: raw.feishu.bossChatId,
+      enabled: raw.feishu.enabled,
     },
     nova: {
       webhookUrl: raw.nova.webhookUrl,
       sessionKey: raw.nova.sessionKey,
+      webhookToken: raw.nova.webhookToken,
+      timeoutMs: raw.nova.timeoutMs,
     },
     db: raw.db,
     web: raw.web,
     ipc: raw.ipc,
     hmacKey,
+    approval: raw.approval,
+    approvalWeb: raw.approvalWeb,
   };
 
   log.info('Configuration loaded successfully');

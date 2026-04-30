@@ -18,6 +18,7 @@ import path from 'node:path';
 import { createLogger } from '../logger/index.js';
 import type { Task } from '../types/index.js';
 import type { TaskManager } from '../task/index.js';
+import type { Notifier } from '../notifier/index.js';
 
 const log = createLogger('executor');
 
@@ -37,15 +38,19 @@ const DEFAULT_LOG_BASE = '/var/log/root-daemon';
 export interface ExecutorOptions {
   /** Override log directory root (useful for tests). Default: /var/log/root-daemon */
   logBase?: string;
+  /** Notifier instance for C5→C6 result delivery (optional; skipped if not provided) */
+  notifier?: Notifier;
 }
 
 export class Executor {
   private taskManager: TaskManager;
   private logBase: string;
+  private notifier: Notifier | null;
 
   constructor(taskManager: TaskManager, options: ExecutorOptions = {}) {
     this.taskManager = taskManager;
     this.logBase = options.logBase ?? DEFAULT_LOG_BASE;
+    this.notifier = options.notifier ?? null;
   }
 
   /**
@@ -147,7 +152,7 @@ export class Executor {
 
       child.on('close', (code) => {
         clearTimeout(killTimer);
-        clearTimeout(sigkillTimer ?? undefined);
+        if (sigkillTimer !== null) clearTimeout(sigkillTimer);
         clearInterval(flushTimer);
 
         // End the merged stream; wait for file write to finish
@@ -178,13 +183,55 @@ export class Executor {
             log.warn({ err, taskId: task.taskId }, 'TaskManager.complete() failed');
           }
 
-          // TODO(C6): trigger Notifier.notify(task, { status, exitCode: code, stdoutSnippet, stderrSnippet, logFile })
+          // C6: trigger Notifier.notify() for result delivery
+          if (this.notifier) {
+            const result = {
+              taskId: task.taskId,
+              status,
+              exitCode: code ?? null,
+              stdoutSnippet,
+              stderrSnippet,
+              logFile,
+              completedAt: Date.now(),
+            };
+            this.notifier.notify(task, result).catch((notifyErr) => {
+              log.warn({ err: notifyErr, taskId: task.taskId }, 'Notifier.notify() failed (non-fatal)');
+            });
+          }
 
           resolve();
         });
 
         fileStream.once('error', (err) => {
           log.error({ err, taskId: task.taskId }, 'Log file write error');
+          try {
+            this.taskManager.complete(task.taskId, {
+              status,
+              exitCode: code,
+              stdoutSnippet,
+              stderrSnippet,
+              logFile: null,
+            });
+          } catch (completeErr) {
+            log.warn({ err: completeErr, taskId: task.taskId }, 'TaskManager.complete() failed after log write error');
+          }
+
+          // C6: trigger Notifier.notify() for result delivery (logFile=null on write error)
+          if (this.notifier) {
+            const result = {
+              taskId: task.taskId,
+              status,
+              exitCode: code ?? null,
+              stdoutSnippet,
+              stderrSnippet,
+              logFile: null,
+              completedAt: Date.now(),
+            };
+            this.notifier.notify(task, result).catch((notifyErr) => {
+              log.warn({ err: notifyErr, taskId: task.taskId }, 'Notifier.notify() failed (non-fatal)');
+            });
+          }
+
           resolve(); // Resolve anyway; log write failure is non-fatal for task lifecycle
         });
       });

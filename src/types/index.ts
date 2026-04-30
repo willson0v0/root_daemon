@@ -93,10 +93,17 @@ export interface DaemonConfig {
   feishu: {
     appId: string;
     appSecret: string;
+    /** Boss's open_id for fallback Feishu notification (C6) */
+    bossChatId?: string;
+    /** Set to false to disable Feishu notifications (default: true) */
+    enabled?: boolean;
   };
   nova: {
     webhookUrl: string;
     sessionKey: string;
+    webhookToken?: string;
+    /** Webhook request timeout in ms (default: 3000) */
+    timeoutMs?: number;
   };
   db?: {
     path?: string;
@@ -109,6 +116,15 @@ export interface DaemonConfig {
     socketPath?: string;
   };
   hmacKey: Buffer;
+  approval?: {
+    callbackPort?: number;
+    callbackHost?: string;
+  };
+  approvalWeb?: {
+    url: string;          // wss://approval.willson0v0.com/ws/agent
+    apiKey: string;
+    machineLabel: string; // "willson-pc"
+  };
 }
 
 // Raw config file (before hmacKey is added)
@@ -116,10 +132,14 @@ export interface RawConfig {
   feishu: {
     appId: string;
     appSecret: string;
+    bossChatId?: string;
+    enabled?: boolean;
   };
   nova: {
     webhookUrl: string;
     sessionKey: string;
+    webhookToken?: string;
+    timeoutMs?: number;
   };
   db?: {
     path?: string;
@@ -130,5 +150,14 @@ export interface RawConfig {
   };
   ipc?: {
     socketPath?: string;
+  };
+  approval?: {
+    callbackPort?: number;
+    callbackHost?: string;
+  };
+  approvalWeb?: {
+    url: string;
+    apiKey: string;
+    machineLabel: string;
   };
 }
