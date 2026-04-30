@@ -1,3 +1,5 @@
+import os from 'node:os';
+import path from 'node:path';
 import { load } from './src/config/index.js';
 import { init as initDb } from './src/db/index.js';
 import { createLogger } from './src/logger/index.js';
@@ -29,7 +31,9 @@ async function main() {
   if (isWsMode) {
     // WS mode: connect to remote approval-web (no IPC, no callback server)
     log.info({ url: config.approvalWeb!.url, machineLabel: config.approvalWeb!.machineLabel }, 'Starting in WS mode');
-    const executor = new Executor(taskManager);
+    // In WS mode, use user-writable log dir by default (avoids EACCES on /var/log/root-daemon)
+    const logBase = process.env['ROOT_DAEMON_LOG'] ?? path.join(os.homedir(), '.root-daemon', 'logs');
+    const executor = new Executor(taskManager, { logBase, skipTaskComplete: true });
     const agentClient = new AgentClient(config.approvalWeb!, executor);
     agentClient.connect();
 
@@ -57,8 +61,9 @@ async function main() {
   // Notifier
   const notifier = new Notifier(ipcServer, config);
 
-  // Executor
-  const executor = new Executor(taskManager, { notifier });
+  // Executor (logBase from env or default /var/log/root-daemon for IPC/root mode)
+  const logBase = process.env['ROOT_DAEMON_LOG'] ?? '/var/log/root-daemon';
+  const executor = new Executor(taskManager, { notifier, logBase });
 
   // Internal callback server (C6)
   const callbackServer = new InternalCallbackServer(taskManager, executor, config);

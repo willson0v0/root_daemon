@@ -32,25 +32,32 @@ const SNIPPET_LIMIT = 4 * 1024;
 const FLUSH_BYTES = 1 * 1024 * 1024; // 1 MB
 const FLUSH_INTERVAL_MS = 1_000;      // 1 s
 
-// Default log base (can be overridden via constructor for testing)
-const DEFAULT_LOG_BASE = '/var/log/root-daemon';
+// Default log base (can be overridden via ROOT_DAEMON_LOG env or constructor)
+const DEFAULT_LOG_BASE = process.env['ROOT_DAEMON_LOG'] ?? '/var/log/root-daemon';
 
 export interface ExecutorOptions {
-  /** Override log directory root (useful for tests). Default: /var/log/root-daemon */
+  /** Override log directory root (useful for tests). Default: process.env.ROOT_DAEMON_LOG ?? /var/log/root-daemon */
   logBase?: string;
   /** Notifier instance for C5→C6 result delivery (optional; skipped if not provided) */
   notifier?: Notifier;
+  /**
+   * Skip TaskManager.complete() after task execution.
+   * Use in WS mode where tasks are synthetic (taskId='ws-<n>') and not in the in-memory DB.
+   */
+  skipTaskComplete?: boolean;
 }
 
 export class Executor {
   private taskManager: TaskManager;
   private logBase: string;
   private notifier: Notifier | null;
+  private skipTaskComplete: boolean;
 
   constructor(taskManager: TaskManager, options: ExecutorOptions = {}) {
     this.taskManager = taskManager;
     this.logBase = options.logBase ?? DEFAULT_LOG_BASE;
     this.notifier = options.notifier ?? null;
+    this.skipTaskComplete = options.skipTaskComplete ?? false;
   }
 
   /**
@@ -170,17 +177,19 @@ export class Executor {
         log.info({ taskId: task.taskId, status, exitCode: code }, 'Child process closed');
 
         fileStream.once('finish', () => {
-          try {
-            this.taskManager.complete(task.taskId, {
-              status,
-              exitCode: code,
-              stdoutSnippet,
-              stderrSnippet,
-              logFile,
-            });
-          } catch (err) {
-            // Task may have been removed from queue (e.g., daemon is shutting down)
-            log.warn({ err, taskId: task.taskId }, 'TaskManager.complete() failed');
+          if (!this.skipTaskComplete) {
+            try {
+              this.taskManager.complete(task.taskId, {
+                status,
+                exitCode: code,
+                stdoutSnippet,
+                stderrSnippet,
+                logFile,
+              });
+            } catch (err) {
+              // Task may have been removed from queue (e.g., daemon is shutting down)
+              log.warn({ err, taskId: task.taskId }, 'TaskManager.complete() failed');
+            }
           }
 
           // C6: trigger Notifier.notify() for result delivery
@@ -204,16 +213,18 @@ export class Executor {
 
         fileStream.once('error', (err) => {
           log.error({ err, taskId: task.taskId }, 'Log file write error');
-          try {
-            this.taskManager.complete(task.taskId, {
-              status,
-              exitCode: code,
-              stdoutSnippet,
-              stderrSnippet,
-              logFile: null,
-            });
-          } catch (completeErr) {
-            log.warn({ err: completeErr, taskId: task.taskId }, 'TaskManager.complete() failed after log write error');
+          if (!this.skipTaskComplete) {
+            try {
+              this.taskManager.complete(task.taskId, {
+                status,
+                exitCode: code,
+                stdoutSnippet,
+                stderrSnippet,
+                logFile: null,
+              });
+            } catch (completeErr) {
+              log.warn({ err: completeErr, taskId: task.taskId }, 'TaskManager.complete() failed after log write error');
+            }
           }
 
           // C6: trigger Notifier.notify() for result delivery (logFile=null on write error)

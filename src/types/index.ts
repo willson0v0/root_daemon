@@ -156,6 +156,7 @@ export interface RawConfig {
     callbackHost?: string;
   };
   approvalWeb?: {
+    /** WebSocket URL, e.g. ws://IP:PORT/ws/agent (plain) or wss://host/ws/agent (TLS) */
     url: string;
     apiKey: string;
     machineLabel: string;
