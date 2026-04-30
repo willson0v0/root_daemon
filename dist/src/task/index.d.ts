@@ -35,8 +35,12 @@ export declare class TaskManager {
     /**
      * Create a new task, persist to SQLite (PENDING), add to memory queue.
      * Returns taskId, approvalLink, and expiresAt.
+     *
+     * If preAssignedTaskId is provided, uses that as taskId instead of generating a new UUID.
+     * When the task already exists in DB, skips INSERT and loads into memory queue directly
+     * (task was already written by approval-web).
      */
-    submit(payload: SubmitPayload): {
+    submit(payload: SubmitPayload, preAssignedTaskId?: string): {
         taskId: string;
         approvalLink: string;
         expiresAt: number;

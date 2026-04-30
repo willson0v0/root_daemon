@@ -24,9 +24,26 @@ export class TaskManager {
     /**
      * Create a new task, persist to SQLite (PENDING), add to memory queue.
      * Returns taskId, approvalLink, and expiresAt.
+     *
+     * If preAssignedTaskId is provided, uses that as taskId instead of generating a new UUID.
+     * When the task already exists in DB, skips INSERT and loads into memory queue directly
+     * (task was already written by approval-web).
      */
-    submit(payload) {
-        const taskId = randomUUID();
+    submit(payload, preAssignedTaskId) {
+        let taskId;
+        let skipInsert = false;
+        if (preAssignedTaskId) {
+            taskId = preAssignedTaskId;
+            // Check if task already exists in DB (pre-inserted by approval-web)
+            const existing = this.db.prepare('SELECT task_id FROM tasks WHERE task_id = ?').get(taskId);
+            if (existing) {
+                skipInsert = true;
+                log.debug({ taskId }, 'Task already exists in DB, skipping INSERT');
+            }
+        }
+        else {
+            taskId = randomUUID();
+        }
         const now = Date.now();
         const expiresInSec = payload.expiresInSec ?? 86400; // default 24h — Boss may be asleep
         const timeoutSec = payload.timeoutSec ?? 86400;
@@ -51,31 +68,33 @@ export class TaskManager {
             logFile: null,
             createdAt: now,
         };
-        // Persist to SQLite (failures are non-fatal — degrade gracefully)
-        try {
-            this.db
-                .prepare(`INSERT INTO tasks (
-            task_id, command, description, risk_hint, agent_session_id,
-            submitted_at, expires_at, timeout_sec, status, created_at
-          ) VALUES (
-            @taskId, @command, @description, @riskHint, @agentSessionId,
-            @submittedAt, @expiresAt, @timeoutSec, @status, @createdAt
-          )`)
-                .run({
-                taskId,
-                command: task.command,
-                description: task.description,
-                riskHint: task.riskHint ?? null,
-                agentSessionId: task.agentSessionId,
-                submittedAt: task.submittedAt,
-                expiresAt: task.expiresAt,
-                timeoutSec: task.timeoutSec,
-                status: task.status,
-                createdAt: task.createdAt,
-            });
-        }
-        catch (err) {
-            log.warn({ err, taskId }, 'SQLite INSERT failed; task kept in memory only');
+        // Persist to SQLite (skip if task was already inserted by approval-web)
+        if (!skipInsert) {
+            try {
+                this.db
+                    .prepare(`INSERT INTO tasks (
+              task_id, command, description, risk_hint, agent_session_id,
+              submitted_at, expires_at, timeout_sec, status, created_at
+            ) VALUES (
+              @taskId, @command, @description, @riskHint, @agentSessionId,
+              @submittedAt, @expiresAt, @timeoutSec, @status, @createdAt
+            )`)
+                    .run({
+                    taskId,
+                    command: task.command,
+                    description: task.description,
+                    riskHint: task.riskHint ?? null,
+                    agentSessionId: task.agentSessionId,
+                    submittedAt: task.submittedAt,
+                    expiresAt: task.expiresAt,
+                    timeoutSec: task.timeoutSec,
+                    status: task.status,
+                    createdAt: task.createdAt,
+                });
+            }
+            catch (err) {
+                log.warn({ err, taskId }, 'SQLite INSERT failed; task kept in memory only');
+            }
         }
         this.queue.set(taskId, task);
         log.info({ taskId, command: task.command }, 'Task submitted');

@@ -51,13 +51,14 @@ async function main() {
                     log.warn({ msg }, 'Invalid SUBMIT_TASK: missing command');
                     return;
                 }
+                const preAssignedTaskId = payload['preAssignedTaskId'];
                 const task = await taskManager.submit({
                     command,
                     description: payload['description'] ?? '',
                     riskHint: payload['riskHint'],
                     agentSessionId: sessionId,
                     timeoutSec: payload['timeoutSec'] ?? 60,
-                });
+                }, preAssignedTaskId);
                 log.info({ taskId: task.taskId }, 'Task submitted, awaiting approval');
                 // Send TASK_ACCEPTED back to agent
                 const approvalLink = `https://approval.willson0v0.com/approve?task_id=${task.taskId}`;
