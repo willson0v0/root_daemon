@@ -31,19 +31,31 @@ export function load() {
         log.error({ configPath, err }, 'Failed to parse config file');
         process.exit(1);
     }
-    // --- Validate required fields ---
-    const missing = [];
-    if (!raw.feishu?.appId)
-        missing.push('feishu.appId');
-    if (!raw.feishu?.appSecret)
-        missing.push('feishu.appSecret');
-    if (!raw.nova?.webhookUrl)
-        missing.push('nova.webhookUrl');
-    if (!raw.nova?.sessionKey)
-        missing.push('nova.sessionKey');
-    if (missing.length > 0) {
-        log.error({ missing }, 'Config validation failed: missing required fields');
-        process.exit(1);
+    // --- Mode-aware validation ---
+    const isWsMode = !!(raw.approvalWeb?.url && raw.approvalWeb?.apiKey && raw.approvalWeb?.machineLabel);
+    if (!isWsMode) {
+        // IPC mode: validate feishu + nova fields
+        const missing = [];
+        if (!raw.feishu?.appId)
+            missing.push('feishu.appId');
+        if (!raw.feishu?.appSecret)
+            missing.push('feishu.appSecret');
+        if (!raw.nova?.webhookUrl)
+            missing.push('nova.webhookUrl');
+        if (!raw.nova?.sessionKey)
+            missing.push('nova.sessionKey');
+        if (missing.length > 0) {
+            log.error({ missing }, 'Config validation failed: missing required fields');
+            process.exit(1);
+        }
+    }
+    else {
+        // WS mode: only validate approvalWeb fields; feishu/nova are optional
+        const aw = raw.approvalWeb;
+        if (!aw.url || !aw.apiKey || !aw.machineLabel) {
+            log.error({ approvalWeb: raw.approvalWeb }, 'Config validation failed: approvalWeb.url, apiKey, machineLabel are required in WS mode');
+            process.exit(1);
+        }
     }
     // --- Load or generate secrets.key ---
     let hmacKey;
@@ -87,18 +99,20 @@ export function load() {
             process.exit(1);
         }
     }
+    // In IPC mode feishu/nova are guaranteed present by validation above.
+    // In WS mode they may be absent; use optional chaining with defaults.
     const config = {
         feishu: {
-            appId: raw.feishu.appId,
-            appSecret: raw.feishu.appSecret,
-            bossChatId: raw.feishu.bossChatId,
-            enabled: raw.feishu.enabled,
+            appId: raw.feishu?.appId ?? '',
+            appSecret: raw.feishu?.appSecret ?? '',
+            bossChatId: raw.feishu?.bossChatId,
+            enabled: raw.feishu?.enabled,
         },
         nova: {
-            webhookUrl: raw.nova.webhookUrl,
-            sessionKey: raw.nova.sessionKey,
-            webhookToken: raw.nova.webhookToken,
-            timeoutMs: raw.nova.timeoutMs,
+            webhookUrl: raw.nova?.webhookUrl ?? '',
+            sessionKey: raw.nova?.sessionKey ?? '',
+            webhookToken: raw.nova?.webhookToken,
+            timeoutMs: raw.nova?.timeoutMs,
         },
         db: raw.db,
         web: raw.web,
